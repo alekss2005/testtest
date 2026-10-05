@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Реконструкция траекторий БПЛА</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { margin:0; height:100%; font-family: system-ui, sans-serif; background:#0f1115; color:#e6e9ef; }
+  #map { position:absolute; inset:0 0 280px 0; }
+  #panel {
+    position:absolute; left:0; right:0; bottom:0; height:280px;
+    background:#181c23; border-top:1px solid #2a3038;
+    display:flex; overflow:hidden;
+  }
+  #controls { width:300px; padding:12px 16px; border-right:1px solid #2a3038; overflow-y:auto; flex-shrink:0; }
+  #controls h3 { margin:0 0 8px; font-size:.85rem; color:#8b93a3; text-transform:uppercase; letter-spacing:.05em; }
+  button {
+    background:#4ea1ff; color:#0b0d10; border:0; border-radius:8px;
+    padding:9px 14px; font-weight:600; cursor:pointer; margin-bottom:8px; width:100%; font-size:.85rem;
+  }
+  button:hover { background:#6cb2ff; }
+  button.secondary { background:#2a3038; color:#e6e9ef; }
+  #messages { flex:1; padding:12px 16px; overflow-y:auto; font-size:.78rem; }
+  .msg { padding:6px 8px; border-left:3px solid #4ea1ff; margin-bottom:6px; background:#1f242d; border-radius:4px; }
+  .msg .time { color:#8b93a3; margin-right:8px; font-variant-numeric:tabular-nums; }
+  .msg .track { color:#ffb454; font-weight:600; margin-left:8px; font-size:.7rem; }
+  .legend {
+    position:absolute; top:12px; right:12px; z-index:1000;
+    background:rgba(15,17,21,.9); padding:10px 14px; border-radius:10px;
+    font-size:.78rem; line-height:1.7; border:1px solid #2a3038;
+  }
+  .legend .row { display:flex; align-items:center; gap:8px; }
+  .legend .swatch { width:22px; height:3px; border-radius:2px; }
+  @media (max-width: 700px) {
+    #map { inset:0 0 320px 0; }
+    #panel { height:320px; flex-direction:column; }
+    #controls { width:100%; border-right:0; border-bottom:1px solid #2a3038; }
+  }
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+<div class="legend">
+  <div class="row"><div class="swatch" style="background:#8b93a3"></div> origin</div>
+  <div class="row"><div class="swatch" style="background:#ffcc00"></div> confirmed</div>
+  <div class="row"><div class="swatch" style="background:#4ea1ff"></div> predicted</div>
+</div>
+
+<div id="panel">
+  <div id="controls">
+    <h3>Управление</h3>
+    <button id="run">▶ Запустить демо</button>
+    <button id="clear" class="secondary">Очистить</button>
+    <h3 style="margin-top:16px">Результат</h3>
+    <div id="stats" style="font-size:.8rem; color:#8b93a3"></div>
+  </div>
+  <div id="messages"></div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+/* ============================================================================
+   1. СЛОВАРЬ ТОПОНИМОВ
+   ============================================================================ */
+const TOPONYMS = {
+  "миколаїв":  { lat: 46.975, lon: 31.994, canon: "Миколаїв" },
+  "вознесенськ": { lat: 47.564, lon: 31.333, canon: "Вознесенськ" },
+  "одеса":     { lat: 46.482, lon: 30.723, canon: "Одеса" },
+  "овідіополь":{ lat: 46.249, lon: 30.442, canon: "Овідіополь" },
+  "білгород-дністровський": { lat: 46.187, lon: 30.349, canon: "Білгород-Дністровський" },
+  "маяки":     { lat: 46.508, lon: 30.176, canon: "Маяки" },
+  "херсон":    { lat: 46.636, lon: 32.615, canon: "Херсон" },
+  "київ":      { lat: 50.450, lon: 30.523, canon: "Київ" },
+  "черкаси":   { lat: 49.444, lon: 32.059, canon: "Черкаси" },
+  "канів":     { lat: 49.752, lon: 31.463, canon: "Канів" },
+  "кременчук": { lat: 49.063, lon: 33.410, canon: "Кременчук" }
+};
+
+/* ============================================================================
+   2. ГЕОМЕТРИЯ
+   ============================================================================ */
+const R_EARTH = 6371;
+const toRad = d => d * Math.PI / 180;
+const toDeg = r => r * 180 / Math.PI;
+
+function haversine(a, b) {
+  const dφ = toRad(b.lat - a.lat), dλ = toRad(b.lon - a.lon);
+  const s = Math.sin(dφ/2)**2 + Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dλ/2)**2;
+  return 2 * R_EARTH * Math.asin(Math.sqrt(s));
+}
+function bearing(a, b) {
+  const φ1 = toRad(a.lat), φ2 = toRad(b.lat), Δλ = toRad(b.lon - a.lon);
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1)*Math.sin(φ2) - Math.sin(φ1)*Math.cos(φ2)*Math.cos(Δλ);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+function destination(p, brg, distKm) {
+  const δ = distKm / R_EARTH, θ = toRad(brg);
+  const φ1 = toRad(p.lat), λ1 = toRad(p.lon);
+  const φ2 = Math.asin(Math.sin(φ1)*Math.cos(δ) + Math.cos(φ1)*Math.sin(δ)*Math.cos(θ));
+  const λ2 = λ1 + Math.atan2(Math.sin(θ)*Math.sin(δ)*Math.cos(φ1), Math.cos(δ) - Math.sin(φ1)*Math.sin(φ2));
+  return { lat: toDeg(φ2), lon: ((toDeg(λ2) + 540) % 360) - 180 };
+}
+function angleDiff(a, b) { return Math.abs(((a - b + 540) % 360) - 180); }
+
+/* ============================================================================
+   3. ПАРСЕР — ИСПРАВЛЕННЫЕ РЕГУЛЯРКИ
+   Используем lookbehind (?<!...) вместо \b, потому что \b не работает с кириллицей.
+   ============================================================================ */
+const UP  = "А-ЯІЇЄҐA-Z";
+const LO  = "а-яіїєґa-z";
+const W   = `${UP}${LO}0-9_'’\\-`;                  // «буквы» для lookbehind
+const TOP = `[${UP}][${W}]*(?:\\s+[${UP}][${W}]*)*`; // топоним: Слово Слово
+
+const RE = {
+  approaching: new RegExp(`(?<![${W}])(?:курсом\\s+на|у\\s+напрямку|в\\s+напрямку|в\\s+бік|на)\\s+(${TOP})`, "giu"),
+  passing:     new RegExp(`(?<![${W}])(?:повз|пройшов|пройшла|пролетів|пролетіла|через)\\s+(${TOP})`, "giu"),
+  from:        new RegExp(`(?<![${W}])(?:з|із|зі|від|з\\s+боку)\\s+(${TOP})`, "giu"),
+  typeReactive: /(реактивн\w*\s+БПЛА|реактивн\w*\s+бпла|герань|шахед)/i,
+  typeMissile:  /(ракет|крилат|баліст|кинджал|іскандер|циркон)/i,
+  typeBalloon:  /(бандерол)/i,
+  dirs: [
+    { re: /північно-?західн|пн\.?\s*-?\s*зх/i, deg: 315 },
+    { re: /північно-?східн|пн\.?\s*-?\s*сх/i,  deg: 45  },
+    { re: /південно-?західн|пд\.?\s*-?\s*зх/i, deg: 225 },
+    { re: /південно-?східн|пд\.?\s*-?\s*сх/i,  deg: 135 },
+    { re: /північн|пн\./i,           deg: 0   },
+    { re: /південн|півдн|пд\./i,     deg: 180 },
+    { re: /західн|зх\./i,            deg: 270 },
+    { re: /східн|сх\./i,             deg: 90  }
+  ]
+};
+
+function normalizeName(s) {
+  return s.trim().toLowerCase().replace(/[’']/g, "'").replace(/\s+/g, " ")
+    .replace(/(ові|еві|єві|і|и|у|ю|а|я)$/u, "");
+}
+function resolveToponym(name) {
+  if (!name) return null;
+  const key = normalizeName(name);
+  if (TOPONYMS[key]) return { ...TOPONYMS[key], key };
+  for (const k of Object.keys(TOPONYMS)) {
+    if (k.startsWith(key) || key.startsWith(k)) return { ...TOPONYMS[k], key: k };
+  }
+  return null;
+}
+function parseMessage(text, timestamp) {
+  const out = { text, timestamp, type: "unknown", approaching: [], passing: [], from: [], compassDeg: null };
+  if (RE.typeMissile.test(text))       out.type = "missile";
+  else if (RE.typeBalloon.test(text))  out.type = "balloon";
+  else if (RE.typeReactive.test(text)) out.type = "reactive_uav";
+
+  for (const m of text.matchAll(RE.approaching)) {
+    const t = resolveToponym(m[1]); if (t) out.approaching.push({ ...t, raw: m[1] });
+  }
+  for (const m of text.matchAll(RE.passing)) {
+    const t = resolveToponym(m[1]); if (t) out.passing.push({ ...t, raw: m[1] });
+  }
+  for (const m of text.matchAll(RE.from)) {
+    const t = resolveToponym(m[1]); if (t) out.from.push({ ...t, raw: m[1] });
+  }
+  for (const d of RE.dirs) if (d.re.test(text)) { out.compassDeg = d.deg; break; }
+  return out;
+}
+
+/* ============================================================================
+   4. WAYPOINTS — ИСПРАВЛЕННАЯ ЛОГИКА КОМПАСА
+   approaching: pos = X + 40км в сторону ИСТОЧНИКА, heading = к X
+   passing:     pos = X + 40км в сторону ДВИЖЕНИЯ, heading = туда же
+   ============================================================================ */
+const APPROACH_OFFSET_KM = 40;
+
+function buildWaypoints(parsed, prevWaypoint) {
+  const wps = [];
+
+  for (const a of parsed.approaching) {
+    let sourceBearing;
+    if (parsed.compassDeg != null)      sourceBearing = parsed.compassDeg;         // "з півдня" = 180
+    else if (prevWaypoint)              sourceBearing = bearing(a, prevWaypoint);  // источник — где были
+    else                                sourceBearing = 180;                       // по умолчанию с юга
+
+    const pos = destination(a, sourceBearing, APPROACH_OFFSET_KM);
+    wps.push({
+      lat: pos.lat, lon: pos.lon,
+      canon: a.canon,
+      role: "approaching",
+      bearing: (sourceBearing + 180) % 360   // ← к цели
+    });
+  }
+
+  for (const p of parsed.passing) {
+    let moveBearing;
+    if (parsed.compassDeg != null)      moveBearing = parsed.compassDeg;           // "у пн-зх напрямку" = 315
+    else if (prevWaypoint)              moveBearing = bearing(prevWaypoint, p);    // откуда пришли → куда
+    else                                moveBearing = 315;
+
+    const pos = destination(p, moveBearing, APPROACH_OFFSET_KM);
+    wps.push({
+      lat: pos.lat, lon: pos.lon,
+      canon: p.canon,
+      role: "passed",
+      bearing: moveBearing
+    });
+  }
+
+  for (const f of parsed.from) {
+    wps.push({ lat: f.lat, lon: f.lon, canon: f.canon, role: "from", bearing: 0 });
+  }
+  return wps;
+}
+
+/* ============================================================================
+   5. КЛАСТЕРИЗАЦИЯ — С ПРОВЕРКОЙ ТИПА
+   ============================================================================ */
+const CLUSTER_WINDOW_MS = 15 * 60 * 1000;
+const MAX_TURN_DEG = 100;
+
+function typeCompatible(a, b) {
+  if (a === "unknown" || b === "unknown") return true;
+  return a === b;
+}
+
+function clusterMessages(parsedMessages) {
+  const sorted = parsedMessages.slice().sort((a, b) => a.timestamp - b.timestamp);
+  const tracks = [];
+
+  for (const msg of sorted) {
+    if (!msg.approaching.length && !msg.passing.length && !msg.from.length) continue;
+
+    let best = null, bestScore = Infinity;
+    for (const tr of tracks) {
+      if (!typeCompatible(tr.type, msg.type)) continue;
+      const last = tr.waypoints[tr.waypoints.length - 1];
+      const dt = msg.timestamp - last.timestamp;
+      if (dt > CLUSTER_WINDOW_MS) continue;
+
+      const wps = buildWaypoints(msg, last);
+      if (!wps.length) continue;
+      const cand = wps[0];
+      const dist = haversine(last, cand);
+
+      let turnPenalty = 0;
+      if (tr.waypoints.length >= 2) {
+        const prev = tr.waypoints[tr.waypoints.length - 2];
+        const turn = angleDiff(bearing(prev, last), bearing(last, cand));
+        if (turn > MAX_TURN_DEG) continue;
+        turnPenalty = turn;
+      }
+      const score = dt / 60000 + dist * 0.5 + turnPenalty * 2;
+      if (score < bestScore) { bestScore = score; best = { tr, wps }; }
+    }
+
+    if (best) {
+      for (const w of best.wps) best.tr.waypoints.push({ ...w, timestamp: msg.timestamp });
+      best.tr.messages.push(msg);
+    } else {
+      const wps = buildWaypoints(msg, null);
+      tracks.push({
+        id: "track-" + (tracks.length + 1),
+        type: msg.type,
+        messages: [msg],
+        waypoints: wps.map(w => ({ ...w, timestamp: msg.timestamp }))
+      });
+    }
+  }
+  return tracks;
+}
+
+/* ============================================================================
+   6. РЕКОНСТРУКЦИЯ
+   ============================================================================ */
+const BACK_EXTRAP_KM    = 150;
+const FORWARD_EXTRAP_KM = 120;
+
+function reconstructTrack(track) {
+  const wps = track.waypoints;
+  if (!wps.length) return null;
+
+  const confirmed = wps.map(w => ({
+    lat: w.lat, lon: w.lon, name: w.canon, role: w.role,
+    bearing: w.bearing, timestamp: w.timestamp
+  }));
+
+  let origin = null;
+  if (confirmed.length >= 2) {
+    const brg = bearing(confirmed[0], confirmed[1]);
+    origin = destination(confirmed[0], (brg + 180) % 360, BACK_EXTRAP_KM);
+  } else if (confirmed[0].bearing != null) {
+    origin = destination(confirmed[0], (confirmed[0].bearing + 180) % 360, BACK_EXTRAP_KM);
+  }
+
+  let predicted = null;
+  const last = confirmed[confirmed.length - 1];
+  let brg;
+  if (confirmed.length >= 2) {
+    const prev = confirmed[confirmed.length - 2];
+    brg = bearing(prev, last);
+  } else {
+    brg = last.bearing != null ? last.bearing : 0;
+  }
+  predicted = {
+    from: last,
+    to: destination(last, brg, FORWARD_EXTRAP_KM),
+    bearing: brg
+  };
+
+  return { id: track.id, type: track.type, messages: track.messages, confirmed, origin, predicted, current: last };
+}
+
+function reconstructTracks(messages) {
+  const parsed = messages.map(m => parseMessage(m.text, m.timestamp));
+  const tracks = clusterMessages(parsed);
+  const reconstructed = tracks.map(reconstructTrack).filter(Boolean);
+  return { tracks: reconstructed, parsed };
+}
+
+/* ============================================================================
+   7. КАРТА
+   ============================================================================ */
+const map = L.map("map").setView([46.8, 31.0], 8);
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  attribution: "© OpenStreetMap"
+}).addTo(map);
+
+const layerGroup = L.layerGroup().addTo(map);
+const COLORS = ["#ffcc00", "#ff6b6b", "#a78bfa", "#34d399", "#fb923c"];
+
+function renderResult(result) {
+  layerGroup.clearLayers();
+  const stats = document.getElementById("stats");
+
+  if (!result.tracks.length) {
+    stats.innerHTML = `<span style="color:#ff5d5d">Треков не найдено.<br>Проверьте, что в сообщениях есть предлоги «на / повз / з» перед топонимом.</span>`;
+    return;
+  }
+
+  stats.innerHTML = `Треков: <b>${result.tracks.length}</b><br><br>`;
+
+  result.tracks.forEach((tr, idx) => {
+    const color = COLORS[idx % COLORS.length];
+
+    if (tr.confirmed.length >= 2) {
+      L.polyline(tr.confirmed.map(p => [p.lat, p.lon]), {
+        color, weight: 4, opacity: 0.9
+      }).addTo(layerGroup);
+    }
+
+    if (tr.origin) {
+      L.polyline([
+        [tr.origin.lat, tr.origin.lon],
+        [tr.confirmed[0].lat, tr.confirmed[0].lon]
+      ], { color: "#8b93a3", weight: 3, dashArray: "4 6", opacity: 0.7 }).addTo(layerGroup);
+    }
+
+    if (tr.predicted) {
+      L.polyline([
+        [tr.predicted.from.lat, tr.predicted.from.lon],
+        [tr.predicted.to.lat, tr.predicted.to.lon]
+      ], { color: "#4ea1ff", weight: 3, dashArray: "8 8" }).addTo(layerGroup);
+    }
+
+    tr.confirmed.forEach(p => {
+      L.circleMarker([p.lat, p.lon], {
+        radius: 5, color, fillColor: color, fillOpacity: 1
+      }).bindPopup(`<b>${p.name}</b><br>роль: ${p.role}<br>курс: ${p.bearing?.toFixed(0) ?? "—"}°`).addTo(layerGroup);
+    });
+
+    const brg = tr.current.bearing ?? tr.predicted?.bearing ?? 0;
+    // 🚀 emoji указывает вправо (90°), поэтому поворачиваем на brg - 90
+    const icon = L.divIcon({
+      className: "",
+      html: `<div style="transform: rotate(${brg - 90}deg); font-size:24px; line-height:1;">🚀</div>`,
+      iconSize: [24, 24], iconAnchor: [12, 12]
+    });
+    L.marker([tr.current.lat, tr.current.lon], { icon })
+      .bindPopup(`<b>${tr.id}</b> (${tr.type})<br>курс: ${brg.toFixed(0)}°`)
+      .addTo(layerGroup);
+
+    stats.innerHTML += `<span style="color:${color}">■</span> ${tr.id} <span style="color:#8b93a3">(${tr.type})</span> — точек ${tr.confirmed.length}, курс ${brg.toFixed(0)}°<br>`;
+  });
+
+  const all = layerGroup.getLayers().flatMap(l => {
+    if (l.getLatLngs) return l.getLatLngs().flat();
+    if (l.getLatLng) return [l.getLatLng()];
+    return [];
+  });
+  if (all.length) map.fitBounds(L.latLngBounds(all), { padding: [40, 40] });
+}
+
+function renderMessages(messages, result) {
+  const box = document.getElementById("messages");
+  box.innerHTML = messages.map(m => {
+    const track = result.tracks.find(t => t.messages.some(tm => tm.timestamp === m.timestamp));
+    const time = new Date(m.timestamp).toISOString().slice(11, 16);
+    return `<div class="msg"><span class="time">${time}</span>${m.text}<span class="track">${track ? track.id : "—"}</span></div>`;
+  }).join("");
+}
+
+/* ============================================================================
+   8. ДЕМО
+   ============================================================================ */
+function demoMessages() {
+  const t = (h, m) => Date.UTC(2026, 9, 5, h - 3, m);
+  return [
+    { text: "2 нові бандеролі на Миколаїв з півдня",                 timestamp: t(12, 45) },
+    { text: "Реактивний БПЛА на Білгород-Дністровський",             timestamp: t(12, 46) },
+    { text: "На Овідіополь",                                         timestamp: t(12, 47) },
+    { text: "Бандероль повз Миколаїв у північно-західному напрямку", timestamp: t(12, 51) },
+    { text: "На Маяки",                                              timestamp: t(12, 52) }
+  ];
+}
+
+document.getElementById("run").onclick = () => {
+  const msgs = demoMessages();
+  const result = reconstructTracks(msgs);
+  renderResult(result);
+  renderMessages(msgs, result);
+  console.log("Tracks:", result.tracks);
+  console.log("Parsed:", result.parsed);
+};
+document.getElementById("clear").onclick = () => {
+  layerGroup.clearLayers();
+  document.getElementById("stats").innerHTML = "";
+  document.getElementById("messages").innerHTML = "";
+};
+
+// Автозапуск
+document.getElementById("run").click();
+</script>
+</body>
+</html>
